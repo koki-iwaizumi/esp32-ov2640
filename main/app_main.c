@@ -10,6 +10,7 @@
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_event_loop.h"
+#include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_err.h"
 #include "nvs_flash.h"
@@ -19,9 +20,13 @@
 #include "camera.h"
 #include "http_server.h"
 
+#include "mbedtls/base64.h"
+
 /********* config ***********/
 #define WIFI_SSID "*"
 #define WIFI_PASSWORD "*"
+#define AWS_ENDPOINT "*"
+#define AWS_API_KEY "*"
 
 /********* i2c ***********/
 #define I2C_CAMERA_TX_BUF_DISABLE 0
@@ -368,30 +373,6 @@ esp_err_t write_camera_config(uint8_t reg, uint8_t data){
     return ESP_OK;
 }
 
-static esp_err_t write_frame(http_context_t http_ctx){
-
-    http_buffer_t fb_data = {
-		.data = camera_get_fb(),
-		.size = camera_get_data_size(),
-		.data_is_persistent = true
-    };
-    return http_response_write(http_ctx, &fb_data);
-}
-
-static void handle_jpg(http_context_t http_ctx, void* ctx){
-
-    esp_err_t err = camera_run();
-    if(err != ESP_OK){
-        ESP_LOGD(TAG, "Camera capture failed with error = %d", err);
-        return;
-    }
-
-    http_response_begin(http_ctx, 200, "image/jpeg", camera_get_data_size());
-    http_response_set_header(http_ctx, "Content-disposition", "inline; filename=capture.jpg");
-    write_frame(http_ctx);
-    http_response_end(http_ctx);
-}
-
 static esp_err_t event_handler(void *ctx, system_event_t *event){
 
     switch(event->event_id){
@@ -479,6 +460,67 @@ void init_i2c(camera_config_t* config){
 	conf.master.clk_speed = I2C_CAMERA_FREQ_HZ;
 	i2c_param_config(i2c_master_port, &conf);
 	i2c_driver_install(i2c_master_port, conf.mode, I2C_CAMERA_RX_BUF_DISABLE, I2C_CAMERA_TX_BUF_DISABLE, 0);
+}
+
+esp_err_t _http_event_handle(esp_http_client_event_t *evt){
+    switch(evt->event_id){
+        case HTTP_EVENT_ERROR:
+            ESP_LOGI(TAG, "HTTP_EVENT_ERROR");
+            break;
+        case HTTP_EVENT_ON_CONNECTED:
+            ESP_LOGI(TAG, "HTTP_EVENT_ON_CONNECTED");
+            break;
+        case HTTP_EVENT_HEADER_SENT:
+            ESP_LOGI(TAG, "HTTP_EVENT_HEADER_SENT");
+            break;
+        case HTTP_EVENT_ON_HEADER:
+            ESP_LOGI(TAG, "HTTP_EVENT_ON_HEADER");
+            printf("%.*s", evt->data_len, (char*)evt->data);
+            break;
+        case HTTP_EVENT_ON_DATA:
+            ESP_LOGI(TAG, "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
+            if( ! esp_http_client_is_chunked_response(evt->client)){
+                printf("%.*s", evt->data_len, (char*)evt->data);
+            }
+            break;
+        case HTTP_EVENT_ON_FINISH:
+            ESP_LOGI(TAG, "HTTP_EVENT_ON_FINISH");
+            break;
+        case HTTP_EVENT_DISCONNECTED:
+            ESP_LOGI(TAG, "HTTP_EVENT_DISCONNECTED");
+            break;
+    }
+    return ESP_OK;
+}
+
+static void http_post_task(){
+
+	esp_http_client_config_t http_config = {
+		.url = AWS_ENDPOINT,
+		.event_handler = _http_event_handle,
+		.method = HTTP_METHOD_POST,
+	};
+
+	unsigned char image0[15000];
+	char image[15000];
+	size_t olen;
+
+	mbedtls_base64_encode(image0, sizeof(image0), &olen, camera_get_fb(), camera_get_data_size());
+	sprintf(image, "{\"image\":\"%s\"}", image0);
+	const char *post_data = (const char*)image;
+
+	esp_http_client_handle_t client = esp_http_client_init(&http_config);
+	esp_http_client_set_post_field(client, post_data, strlen(post_data));
+	esp_http_client_set_header(client, "x-api-key", AWS_API_KEY);
+	esp_http_client_set_header(client, "Content-Type", "application/json");
+
+	esp_err_t err = esp_http_client_perform(client);
+	if(err == ESP_OK){
+	   ESP_LOGI(TAG, "Status = %d, content_length = %d", esp_http_client_get_status_code(client), esp_http_client_get_content_length(client));
+	}
+	esp_http_client_cleanup(client);
+
+	while(1);
 }
 
 void app_main(){
@@ -595,13 +637,15 @@ void app_main(){
 
 	//CAMERA wifi設定
     initialise_wifi();
-    http_server_t server;
-    http_server_options_t http_options = HTTP_SERVER_OPTIONS_DEFAULT();
-    http_server_start(&http_options, &server);
 
-	http_register_handler(server, "/jpg", HTTP_GET, HTTP_HANDLE_RESPONSE, &handle_jpg, NULL);
-	ESP_LOGI(TAG, "Open http://" IPSTR "/jpg for single image/jpg image", IP2STR(&s_ip_addr));
+	//写真撮影
+    err = camera_run();
+    if(err != ESP_OK){
+        ESP_LOGD(TAG, "Camera capture failed with error = %d", err);
+        return;
+    }
 
-    ESP_LOGI(TAG, "Free heap: %u", xPortGetFreeHeapSize());
-    ESP_LOGI(TAG, "Camera demo ready");
+	xTaskCreate(&http_post_task, "http_post_task", 50000, NULL, 5, NULL);
+
+	vTaskDelay(10000 / portTICK_RATE_MS);
 }
